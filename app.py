@@ -7,43 +7,80 @@ from huggingface_hub import hf_hub_download
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
 REPO_ID = "Shakuji/stock-predictor-model" 
 MODEL_FILE = "model.pkl" 
+MARKET_INDEX = "^NSEI" # Nifty 50
+
+# --- MATH HELPERS ---
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def add_patterns(df):
+    body_size = abs(df['Close'] - df['Open'])
+    full_range = df['High'] - df['Low']
+    upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
+    lower_shadow = df[['Open', 'Close']].min(axis=1) - df['Low']
+    
+    df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
+    df['Is_Hammer'] = ((lower_shadow >= (body_size * 2)) & (upper_shadow <= (body_size * 0.5))).astype(int)
+    df['Is_ShootingStar'] = ((upper_shadow >= (body_size * 2)) & (lower_shadow <= (body_size * 0.5))).astype(int)
+    
+    prev_open = df['Open'].shift(1)
+    prev_close = df['Close'].shift(1)
+    df['Is_Engulfing'] = ((df['Close'] > df['Open']) & (prev_close < prev_open) & (df['Close'] > prev_open) & (df['Open'] < prev_close)).astype(int)
+    
+    df['Is_Marubozu'] = (body_size > (full_range * 0.9)).astype(int)
+    return df
 
 def get_prediction_and_data(ticker):
     try:
-        # 1. Download Model (Public)
         model_path = hf_hub_download(repo_id=REPO_ID, filename=MODEL_FILE)
         model = joblib.load(model_path)
         
-        # 2. Get Data
+        # 1. Fetch Stock Data
         stock = yf.Ticker(ticker)
-        df = stock.history(period="6mo") 
-        
-        # Error Handling
-        if df.empty: 
-            return None, f"Could not find data for '{ticker}'. <br>Hint: For Oracle India, use 'OFSS'. For Tata, use 'TATASTEEL'.", None, None
-        
-        if len(df) < 60: 
-            return None, "Insufficient data (Need 60+ days of history)", None, None
+        df = stock.history(period="1y") 
+        if df.empty or len(df) < 60: 
+            return None, "Insufficient Data", None, None
 
-        # 3. Prepare Graph Data
+        # 2. Fetch Market Context (Nifty 50)
+        nifty = yf.Ticker(MARKET_INDEX)
+        nifty_df = nifty.history(period="1y")
+        
+        # Join Nifty Data (Align dates)
+        nifty_df = nifty_df[["Close"]].rename(columns={"Close": "Close_Market"})
+        nifty_df["Return_Market"] = nifty_df["Close_Market"].pct_change()
+        
+        df = df.join(nifty_df["Return_Market"])
+        df["Return_Market"] = df["Return_Market"].fillna(0) # Safety fill
+
         dates = df.index.strftime('%d %b').tolist()[-90:] 
         prices = df['Close'].round(2).tolist()[-90:]
         
-        # 4. Calculate Indicators
+        # 3. Calculate All Indicators
         df["SMA_10"] = df["Close"].rolling(window=10).mean()
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
+        df["RSI"] = calculate_rsi(df["Close"])
+        df["Volatility"] = df["Close"].rolling(window=10).std()
         df["Return"] = df["Close"].pct_change()
         
-        latest = df.iloc[-1:].copy()
-        features = ["SMA_10", "SMA_50", "Return", "Open", "High", "Low", "Close"]
+        df = add_patterns(df)
         
-        # --- THE FIX: Create Named DataFrame ---
+        latest = df.iloc[-1:].copy()
+        
+        # 4. Prepare Feature Vector (Order matters!)
+        features = [
+            "SMA_10", "SMA_50", "RSI", "Volatility", "Return", 
+            "Return_Market", 
+            "Is_Doji", "Is_Hammer", "Is_ShootingStar", "Is_Engulfing", "Is_Marubozu"
+        ]
+        
         input_df = pd.DataFrame(latest[features].values, columns=features)
         
-        # 5. Predict
         pred = model.predict(input_df)[0]
         prob = model.predict_proba(input_df)[0][pred]
         
@@ -51,10 +88,7 @@ def get_prediction_and_data(ticker):
         return direction, prob, dates, prices
         
     except Exception as e:
-        err_msg = str(e)
-        if "feature names" in err_msg:
-            return None, "Model Mismatch: Please run 'Daily Retrain' in GitHub Actions.", None, None
-        return None, f"System Error: {err_msg}", None, None
+        return None, f"Error: {str(e)}", None, None
 
 # --- UI TEMPLATE ---
 HTML_TEMPLATE = """
