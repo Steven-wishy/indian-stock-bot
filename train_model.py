@@ -9,7 +9,7 @@ from huggingface_hub import HfApi
 # --- CONFIG ---
 SYMBOL = "RELIANCE.NS" 
 # CHANGE THIS to your actual Hugging Face username
-REPO_ID = "YOUR_HF_USERNAME/stock-predictor-model" 
+REPO_ID = "Shakuji/stock-predictor-model" 
 MODEL_FILE = "model.pkl"
 
 def train():
