@@ -7,58 +7,27 @@ import joblib
 from huggingface_hub import HfApi
 import numpy as np
 
-# --- CONFIG ---
-# 1. We train on 10 major stocks to learn general patterns
+# --- CONFIG: THE MEGA BASKET (30+ Market Leaders) ---
 TRAINING_BASKET = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", 
-    "TATAMOTORS.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS"
+    # BANKS & FINANCE
+    "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "BAJFINANCE.NS",
+    # IT & TECH
+    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HCLTECH.NS", "WIPRO.NS", "TECHM.NS",
+    # AUTO
+    "TATAMOTORS.NS", "M&M.NS", "MARUTI.NS", "EICHERMOT.NS",
+    # METALS & ENERGY
+    "TATASTEEL.NS", "HINDALCO.NS", "JSWSTEEL.NS", "ONGC.NS", "NTPC.NS", "POWERGRID.NS",
+    # CONSUMER & PHARMA
+    "ITC.NS", "HINDUNILVR.NS", "ASIANPAINT.NS", "TITAN.NS", "SUNPHARMA.NS", "CIPLA.NS",
+    # INDEX
+    "^NSEI"
 ]
-# 2. We also fetch the Market Index to understand "Market Mood"
-MARKET_INDEX = "^NSEI" 
 
 REPO_ID = "Shakuji/stock-predictor-model" 
-MODEL_FILE = "model.pkl"
+# Horizons: 1 Day, 1 Week (5 days), 1 Month (20 days)
+HORIZONS = {"1d": 1, "1w": 5, "1m": 20}
 
-# --- HELPER: Advanced Pattern Recognition ---
-def add_patterns(df):
-    # Base measurements
-    body_size = abs(df['Close'] - df['Open'])
-    full_range = df['High'] - df['Low']
-    upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
-    lower_shadow = df[['Open', 'Close']].min(axis=1) - df['Low']
-    
-    # 1. Doji (Indecision)
-    df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
-    
-    # 2. Hammer (Bullish Reversal)
-    df['Is_Hammer'] = (
-        (lower_shadow >= (body_size * 2)) & 
-        (upper_shadow <= (body_size * 0.5))
-    ).astype(int)
-    
-    # 3. Shooting Star (Bearish Reversal - Inverted Hammer at top)
-    df['Is_ShootingStar'] = (
-        (upper_shadow >= (body_size * 2)) &
-        (lower_shadow <= (body_size * 0.5))
-    ).astype(int)
-    
-    # 4. Bullish Engulfing (Strong Buy)
-    prev_open = df['Open'].shift(1)
-    prev_close = df['Close'].shift(1)
-    df['Is_Engulfing'] = (
-        (df['Close'] > df['Open']) & 
-        (prev_close < prev_open) & 
-        (df['Close'] > prev_open) & 
-        (df['Open'] < prev_close)
-    ).astype(int)
-
-    # 5. Marubozu (Strong Momentum - No shadows)
-    df['Is_Marubozu'] = (
-        (body_size > (full_range * 0.9)) # Body is 90% of the candle
-    ).astype(int)
-    
-    return df
-
+# --- MATH INDICATORS ---
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -66,86 +35,122 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def get_stock_data(symbol, market_df=None):
-    print(f"📥 Fetching {symbol}...")
-    stock = yf.Ticker(symbol)
-    df = stock.history(period="2y")
+def add_features(df):
+    # 1. Trend (MACD)
+    ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # 2. Volatility (Bollinger Bands & ATR)
+    sma_20 = df['Close'].rolling(window=20).mean()
+    std_20 = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = sma_20 + (std_20 * 2)
+    df['BB_Lower'] = sma_20 - (std_20 * 2)
     
-    if len(df) < 200: return None
+    high_low = df['High'] - df['Low']
+    high_close = abs(df['High'] - df['Close'].shift())
+    low_close = abs(df['Low'] - df['Close'].shift())
+    df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
+
+    # 3. Candlestick Patterns
+    body_size = abs(df['Close'] - df['Open'])
+    full_range = df['High'] - df['Low']
+    upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
+    lower_shadow = df[['Open', 'Close']].min(axis=1) - df['Low']
     
-    # --- TECHNICAL INDICATORS ---
-    df["SMA_10"] = df["Close"].rolling(window=10).mean()
-    df["SMA_50"] = df["Close"].rolling(window=50).mean()
-    df["RSI"] = calculate_rsi(df["Close"])
-    df["Volatility"] = df["Close"].rolling(window=10).std()
-    df["Return"] = df["Close"].pct_change()
+    df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
+    df['Is_Hammer'] = ((lower_shadow >= (body_size * 2)) & (upper_shadow <= (body_size * 0.5))).astype(int)
     
-    # --- MARKET CONTEXT (The "Nifty Filter") ---
-    # We join the Nifty 50 return to the stock data
-    if market_df is not None:
-        df = df.join(market_df, rsuffix="_Market")
-        # Fill missing market days with 0 change
-        df["Return_Market"] = df["Return_Market"].fillna(0)
-    else:
-        # If Nifty fetch failed, assume neutral market
-        df["Return_Market"] = 0
-    
-    # --- PATTERN RECOGNITION ---
-    df = add_patterns(df)
-    
-    # Target: 1 if Price UP tomorrow
-    df["Target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-    df = df.dropna()
+    # 4. Memory Lags (Sequence Reasoning)
+    for lag in range(1, 6): 
+        df[f'Return_Lag_{lag}'] = df['Close'].pct_change(lag)
+
     return df
 
+def get_stock_data(symbol):
+    try:
+        stock = yf.Ticker(symbol)
+        df = stock.history(period="2y")
+        if len(df) < 200: return None
+        
+        df["SMA_10"] = df["Close"].rolling(window=10).mean()
+        df["SMA_50"] = df["Close"].rolling(window=50).mean()
+        df["RSI"] = calculate_rsi(df["Close"])
+        df["Volatility"] = df["Close"].rolling(window=10).std()
+        
+        df = add_features(df)
+        df = df.dropna()
+        return df
+    except:
+        return None
+
 def train():
-    # 1. Fetch Market Context First
-    print(f"📊 Fetching Market Index ({MARKET_INDEX})...")
-    nifty = yf.Ticker(MARKET_INDEX)
-    nifty_df = nifty.history(period="2y")
-    nifty_df["Return"] = nifty_df["Close"].pct_change()
-    # We only need the market return column
-    market_signal = nifty_df[["Return"]]
-    
     all_data = []
-    print("🚀 Starting Pro-Tier Training...")
+    print("🚀 Collecting Data from 30+ Market Leaders...")
     
     for ticker in TRAINING_BASKET:
-        df = get_stock_data(ticker, market_signal)
+        df = get_stock_data(ticker)
         if df is not None:
             all_data.append(df)
             
     full_df = pd.concat(all_data)
-    print(f"✅ Training on {len(full_df)} rows of data.")
-    
-    # The Full Feature List
-    features = [
-        "SMA_10", "SMA_50", "RSI", "Volatility", "Return", 
-        "Return_Market", # <--- Nifty Impact
-        "Is_Doji", "Is_Hammer", "Is_ShootingStar", "Is_Engulfing", "Is_Marubozu"
-    ]
-    
-    X = full_df[features]
-    y = full_df["Target"]
-    
-    # Deeper Trees for complex patterns
-    model = xgb.XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=7, random_state=42)
-    model.fit(X, y)
-    
-    acc = accuracy_score(y.iloc[-1000:], model.predict(X.iloc[-1000:]))
-    print(f"🏆 Final Model Accuracy: {acc:.2%}")
-    
-    joblib.dump(model, MODEL_FILE)
+    print(f"✅ Dataset Ready: {len(full_df)} rows.")
+
+    # Feature List
+    features = ["SMA_10", "SMA_50", "RSI", "Volatility", "MACD", "MACD_Signal", 
+                "BB_Upper", "BB_Lower", "ATR", "Is_Doji", "Is_Hammer"]
+    features += [f'Return_Lag_{i}' for i in range(1, 6)]
     
     api = HfApi()
-    api.upload_file(
-        path_or_fileobj=MODEL_FILE,
-        path_in_repo=MODEL_FILE,
-        repo_id=REPO_ID,
-        repo_type="model",
-        token=os.getenv("HF_TOKEN")
-    )
-    print("🎉 Upload Success!")
+
+    # --- TRAIN LOOP FOR EACH HORIZON ---
+    for name, days in HORIZONS.items():
+        print(f"\n🧠 Optimizing '{name.upper()}' Model (Target: {days} days)...")
+        
+        # Prepare Target
+        df_train = full_df.copy()
+        df_train["Target"] = (df_train["Close"].shift(-days) > df_train["Close"]).astype(int)
+        df_train = df_train.dropna()
+        
+        X = df_train[features]
+        y = df_train["Target"]
+
+        # --- PHASE 1: DRAFT TRAINING (Mock Exam) ---
+        print("   📝 Phase 1: Draft Training...")
+        draft_model = xgb.XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.05, random_state=42)
+        draft_model.fit(X, y)
+
+        # --- PHASE 2: ERROR AUDIT (Self-Correction) ---
+        print("   🔍 Phase 2: Auditing Mistakes...")
+        predictions = draft_model.predict(X)
+        
+        # Weight Logic: If Wrong -> Weight = 3.0. If Right -> Weight = 1.0
+        weights = np.where(predictions == y, 1.0, 3.0)
+        error_count = np.sum(predictions != y)
+        print(f"      Found {error_count} mistakes. Applying 3x Penalty Weights.")
+
+        # --- PHASE 3: FINAL TRAINING (With Weights) ---
+        print("   🚀 Phase 3: Final Weighted Training...")
+        final_model = xgb.XGBClassifier(n_estimators=500, max_depth=8, learning_rate=0.02, random_state=42)
+        final_model.fit(X, y, sample_weight=weights)
+        
+        # Stats
+        acc = accuracy_score(y.iloc[-2000:], final_model.predict(X.iloc[-2000:]))
+        print(f"🏆 Final Accuracy ({name}): {acc:.2%}")
+        
+        # Save & Upload
+        filename = f"model_{name}.pkl"
+        joblib.dump(final_model, filename)
+        
+        print(f"☁️ Uploading {filename}...")
+        api.upload_file(
+            path_or_fileobj=filename,
+            path_in_repo=filename,
+            repo_id=REPO_ID,
+            repo_type="model",
+            token=os.getenv("HF_TOKEN")
+        )
 
 if __name__ == "__main__":
     train()
