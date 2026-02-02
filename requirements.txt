@@ -2,8 +2,8 @@ flask
 gunicorn
 yfinance
 pandas
-numpy
-scikit-learn==1.3.2
+numpy>=1.26.0
+scikit-learn==1.5.0
 xgboost==2.0.3
 joblib
 huggingface_hub
