@@ -11,11 +11,12 @@ app = Flask(__name__)
 REPO_ID = "Shakuji/stock-predictor-model" 
 MODEL_FILE = "model.pkl" 
 
+# Updated function for PUBLIC models (No Token needed)
 def get_prediction_and_data(ticker):
     try:
-        # 1. Download Model
-        token = os.environ.get("HF_TOKEN")
-        model_path = hf_hub_download(repo_id=REPO_ID, filename=MODEL_FILE, token=token)
+        # 1. Download Model (Anonymous - No Token needed)
+        # We removed the 'token=' part
+        model_path = hf_hub_download(repo_id=REPO_ID, filename=MODEL_FILE)
         model = joblib.load(model_path)
         
         # 2. Get Data (Last 3 months for graph + prediction)
@@ -24,12 +25,11 @@ def get_prediction_and_data(ticker):
         
         if len(df) < 60: return None, "Insufficient data (Need 60+ days)", None, None
 
-        # 3. Prepare Graph Data (Dates & Prices)
-        # Convert timestamps to string format "DD MMM"
+        # 3. Prepare Graph Data
         dates = df.index.strftime('%d %b').tolist()
         prices = df['Close'].round(2).tolist()
         
-        # 4. Calculate Indicators for Model
+        # 4. Calculate Indicators
         df["SMA_10"] = df["Close"].rolling(window=10).mean()
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["Return"] = df["Close"].pct_change()
