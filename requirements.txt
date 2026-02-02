@@ -1,0 +1,8 @@
+flask
+gunicorn
+yfinance
+pandas
+scikit-learn
+xgboost
+joblib
+huggingface_hub
