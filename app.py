@@ -4,14 +4,14 @@ import joblib
 import json
 import pandas as pd
 from huggingface_hub import hf_hub_download
+import numpy as np
 
 app = Flask(__name__)
 
 REPO_ID = "Shakuji/stock-predictor-model" 
-MODEL_FILE = "model.pkl" 
-MARKET_INDEX = "^NSEI" # Nifty 50
+MARKET_INDEX = "^NSEI"
 
-# --- MATH HELPERS ---
+# --- MATH & FEATURE LOGIC ---
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -19,7 +19,22 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def add_patterns(df):
+def add_features(df):
+    ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    sma_20 = df['Close'].rolling(window=20).mean()
+    std_20 = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = sma_20 + (std_20 * 2)
+    df['BB_Lower'] = sma_20 - (std_20 * 2)
+    
+    high_low = df['High'] - df['Low']
+    high_close = abs(df['High'] - df['Close'].shift())
+    low_close = abs(df['Low'] - df['Close'].shift())
+    df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
+
     body_size = abs(df['Close'] - df['Open'])
     full_range = df['High'] - df['Low']
     upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
@@ -27,68 +42,128 @@ def add_patterns(df):
     
     df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
     df['Is_Hammer'] = ((lower_shadow >= (body_size * 2)) & (upper_shadow <= (body_size * 0.5))).astype(int)
-    df['Is_ShootingStar'] = ((upper_shadow >= (body_size * 2)) & (lower_shadow <= (body_size * 0.5))).astype(int)
-    
-    prev_open = df['Open'].shift(1)
-    prev_close = df['Close'].shift(1)
-    df['Is_Engulfing'] = ((df['Close'] > df['Open']) & (prev_close < prev_open) & (df['Close'] > prev_open) & (df['Open'] < prev_close)).astype(int)
-    
-    df['Is_Marubozu'] = (body_size > (full_range * 0.9)).astype(int)
+
+    for lag in range(1, 6):
+        df[f'Return_Lag_{lag}'] = df['Close'].pct_change(lag)
     return df
 
-def get_prediction_and_data(ticker):
+def generate_reasoning(row):
+    reasons = []
+    # RSI
+    if row['RSI'] > 70: reasons.append("⚠️ <b>RSI Overbought:</b> Risk of Pullback.")
+    elif row['RSI'] < 30: reasons.append("💎 <b>RSI Oversold:</b> Potential Value Zone.")
+    else: reasons.append("✅ <b>RSI Neutral:</b> Safe zone.")
+    
+    # MACD
+    if row['MACD'] > row['MACD_Signal']: reasons.append("🚀 <b>MACD Bullish:</b> Momentum is Positive.")
+    else: reasons.append("📉 <b>MACD Bearish:</b> Momentum is Negative.")
+    
+    # Bollinger
+    if row['Close'] > row['BB_Upper']: reasons.append("⚠️ <b>Bollinger High:</b> Price extended above bands.")
+    elif row['Close'] < row['BB_Lower']: reasons.append("🛡️ <b>Bollinger Low:</b> Price at support band.")
+
+    return "<br>".join(reasons)
+
+def calculate_position_size(wallet, risk_per_trade, price, atr):
+    # Professional Risk Formula: Risk / (2 * ATR)
+    risk_amount = wallet * (risk_per_trade / 100)
+    sl_distance = 2 * atr
+    
+    if sl_distance == 0: return 0, 0, 0
+    
+    qty = int(risk_amount / sl_distance)
+    
+    # Safety Cap: Max 25% of wallet on one stock
+    max_alloc = wallet * 0.25
+    if (qty * price) > max_alloc:
+        qty = int(max_alloc / price)
+        
+    capital = qty * price
+    return qty, capital, sl_distance
+
+def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=100000, risk=2):
     try:
-        model_path = hf_hub_download(repo_id=REPO_ID, filename=MODEL_FILE)
+        model_filename = f"model_{horizon}.pkl"
+        model_path = hf_hub_download(repo_id=REPO_ID, filename=model_filename)
         model = joblib.load(model_path)
         
-        # 1. Fetch Stock Data
         stock = yf.Ticker(ticker)
-        df = stock.history(period="1y") 
-        if df.empty or len(df) < 60: 
-            return None, "Insufficient Data", None, None
+        df = stock.history(period="2y") 
+        if df.empty or len(df) < 60: return None
 
-        # 2. Fetch Market Context (Nifty 50)
-        nifty = yf.Ticker(MARKET_INDEX)
-        nifty_df = nifty.history(period="1y")
+        # Filter Graph Data
+        graph_days = 90
+        if graph_range == "1mo": graph_days = 30
+        elif graph_range == "6mo": graph_days = 180
+        elif graph_range == "1y": graph_days = 365
         
-        # Join Nifty Data (Align dates)
-        nifty_df = nifty_df[["Close"]].rename(columns={"Close": "Close_Market"})
-        nifty_df["Return_Market"] = nifty_df["Close_Market"].pct_change()
-        
-        df = df.join(nifty_df["Return_Market"])
-        df["Return_Market"] = df["Return_Market"].fillna(0) # Safety fill
-
-        dates = df.index.strftime('%d %b').tolist()[-90:] 
-        prices = df['Close'].round(2).tolist()[-90:]
-        
-        # 3. Calculate All Indicators
+        # Calculate Features
         df["SMA_10"] = df["Close"].rolling(window=10).mean()
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["RSI"] = calculate_rsi(df["Close"])
         df["Volatility"] = df["Close"].rolling(window=10).std()
-        df["Return"] = df["Close"].pct_change()
-        
-        df = add_patterns(df)
+        df = add_features(df)
         
         latest = df.iloc[-1:].copy()
         
-        # 4. Prepare Feature Vector (Order matters!)
-        features = [
-            "SMA_10", "SMA_50", "RSI", "Volatility", "Return", 
-            "Return_Market", 
-            "Is_Doji", "Is_Hammer", "Is_ShootingStar", "Is_Engulfing", "Is_Marubozu"
-        ]
+        # Predict
+        features = ["SMA_10", "SMA_50", "RSI", "Volatility", "MACD", "MACD_Signal", 
+                    "BB_Upper", "BB_Lower", "ATR", "Is_Doji", "Is_Hammer"]
+        features += [f'Return_Lag_{i}' for i in range(1, 6)]
         
         input_df = pd.DataFrame(latest[features].values, columns=features)
+        prob_score = model.predict_proba(input_df)[0][1]
+
+        # Traffic Light Logic
+        if 0.45 <= prob_score <= 0.55:
+            direction = "NEUTRAL"
+            term = "Wait / Unsure"
+            final_prob = 50.0
+        elif prob_score > 0.55:
+            direction = "BULLISH"
+            term = "Likely UP"
+            final_prob = prob_score * 100
+        else:
+            direction = "BEARISH"
+            term = "Likely DOWN"
+            final_prob = (1 - prob_score) * 100
+            
+        reasoning = generate_reasoning(latest.iloc[0])
+
+        # Portfolio Calc
+        current_price = latest['Close'].values[0]
+        current_atr = latest['ATR'].values[0]
+        qty, capital, sl_dist = calculate_position_size(float(wallet), float(risk), current_price, current_atr)
         
-        pred = model.predict(input_df)[0]
-        prob = model.predict_proba(input_df)[0][pred]
-        
-        direction = "BULLISH" if pred == 1 else "BEARISH"
-        return direction, prob, dates, prices
+        # Set Targets
+        if direction == "BULLISH":
+            sl_price = current_price - sl_dist
+            target_price = current_price + (sl_dist * 1.5)
+        else:
+            sl_price = current_price + sl_dist
+            target_price = current_price - (sl_dist * 1.5)
+            
+        dates = df.index.strftime('%d %b').tolist()[-graph_days:] 
+        prices = df['Close'].round(2).tolist()[-graph_days:]
+
+        return {
+            "direction": direction,
+            "prob": round(final_prob, 1),
+            "dates": json.dumps(dates),
+            "prices": json.dumps(prices),
+            "term": term,
+            "reasoning": reasoning,
+            "atr": round(current_atr, 2),
+            "last_price": round(current_price, 2),
+            "qty": qty,
+            "capital": round(capital, 2),
+            "wallet_pct": round((capital / float(wallet)) * 100, 1),
+            "stop_loss": round(sl_price, 2),
+            "target": round(target_price, 2)
+        }
         
     except Exception as e:
-        return None, f"Error: {str(e)}", None, None
+        return {"error": str(e)}
 
 # --- UI TEMPLATE ---
 HTML_TEMPLATE = """
@@ -96,94 +171,197 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Oracle /// Market Intelligence</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Oracle V3 /// Portfolio Architect</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
     <style>
-        :root { --bg: #050505; --surface: #121212; --border: #333333; --text-main: #ffffff; --text-muted: #888888; --accent: #FFFFFF; --green: #34D399; --red: #F87171; --font: 'Inter', sans-serif; }
-        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-        body { background-color: var(--bg); color: var(--text-main); font-family: var(--font); margin: 0; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
-        .app-container { width: 100%; max-width: 480px; padding: 24px; display: flex; flex-direction: column; gap: 32px; }
-        header { margin-top: 20px; border-bottom: 1px solid var(--border); padding-bottom: 20px; }
-        h1 { font-weight: 300; font-size: 24px; letter-spacing: -0.5px; margin: 0; color: var(--text-muted); }
-        h1 span { color: var(--text-main); font-weight: 600; }
-        .input-group { position: relative; width: 100%; }
-        input { width: 100%; background: transparent; border: none; border-bottom: 1px solid var(--border); color: var(--text-main); font-family: var(--font); font-size: 32px; padding: 10px 0; outline: none; transition: border 0.3s; border-radius: 0; }
-        input:focus { border-bottom-color: var(--accent); }
-        input::placeholder { color: #333; }
-        button { margin-top: 20px; width: 100%; padding: 16px; background: var(--text-main); color: var(--bg); border: none; font-family: var(--font); font-weight: 600; font-size: 14px; letter-spacing: 0.5px; text-transform: uppercase; cursor: pointer; transition: opacity 0.2s; }
-        button:active { opacity: 0.8; }
-        .result-panel { animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1); }
-        .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
-        .metric { background: var(--surface); padding: 16px; border: 1px solid var(--border); }
-        .label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; display: block; }
-        .value { font-size: 18px; font-weight: 400; }
-        .bullish { color: var(--green); }
-        .bearish { color: var(--red); }
-        .chart-container { position: relative; height: 250px; width: 100%; margin-top: 20px; }
-        .loader { height: 2px; width: 100%; background: #333; position: relative; overflow: hidden; display: none; margin-top: 20px; }
-        .loader::after { content: ''; position: absolute; left: -50%; height: 100%; width: 50%; background: var(--text-main); animation: load 1s infinite ease-in-out; }
-        .error-box { color: var(--red); margin-top: 20px; font-size: 14px; line-height: 1.5; background: rgba(248, 113, 113, 0.1); padding: 15px; border-left: 2px solid var(--red); }
-        @keyframes load { 0% { left: -50%; } 100% { left: 100%; } }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        :root { --bg: #050505; --surface: #121212; --border: #333; --text: #fff; --text-muted: #888; --green: #34D399; --red: #F87171; --yellow: #FBBF24; --blue: #3B82F6; }
+        body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        .app { width: 100%; max-width: 600px; display: flex; flex-direction: column; gap: 20px; }
+        .header { border-bottom: 1px solid var(--border); padding-bottom: 15px; }
+        h1 { font-weight: 300; margin: 0; font-size: 24px; } h1 span { font-weight: 600; }
+        
+        .controls { display: grid; gap: 10px; background: var(--surface); padding: 15px; border: 1px solid var(--border); }
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        input, button, select { background: #000; border: 1px solid var(--border); color: #fff; padding: 10px; width: 100%; box-sizing: border-box; }
+        button { background: #fff; color: #000; font-weight: 600; cursor: pointer; border: none; }
+        
+        .result-card { background: var(--surface); border: 1px solid var(--border); padding: 20px; animation: slideUp 0.5s ease; }
+        .metric-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid #222; padding-bottom: 15px; }
+        .big-val { font-size: 28px; font-weight: 600; }
+        .sub-val { font-size: 13px; color: var(--text-muted); }
+        .bullish { color: var(--green); } .bearish { color: var(--red); } .neutral { color: var(--yellow); }
+
+        .portfolio-box { background: rgba(59, 130, 246, 0.1); border: 1px solid var(--blue); padding: 15px; margin-bottom: 20px; }
+        .plan-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center; margin-top: 10px; }
+        .plan-item div:first-child { font-size: 11px; color: var(--text-muted); }
+        .plan-item div:last-child { font-size: 16px; font-weight: 600; }
+
+        .chart-box { height: 250px; position: relative; margin-top: 20px; }
+        .error { color: var(--red); padding: 10px; background: rgba(248,113,113,0.1); }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body>
-    <div class="app-container">
-        <header><h1>ORACLE <span>/// AI</span></h1></header>
-        <form method="POST" onsubmit="document.querySelector('.loader').style.display = 'block'">
-            <div class="input-group">
-                <input type="text" name="ticker" placeholder="TICKER" value="{{ ticker }}" autocomplete="off" autocorrect="off">
-            </div>
-            <div class="loader"></div>
-            <button type="submit">Analyze Asset</button>
-        </form>
-        {% if error %}
-            <div class="error-box">/// ERROR: {{ error | safe }}</div>
-        {% endif %}
-        {% if prediction %}
-        <div class="result-panel">
-            <div class="metric-grid">
-                <div class="metric"><span class="label">Forecast</span><span class="value {{ 'bullish' if prediction == 'BULLISH' else 'bearish' }}">{{ prediction }}</span></div>
-                <div class="metric"><span class="label">Confidence</span><span class="value">{{ confidence }}%</span></div>
-            </div>
-            <span class="label">Price Action (90 Days)</span>
-            <div class="chart-container"><canvas id="stockChart"></canvas></div>
+    <div class="app">
+        <div class="header">
+            <h1>ORACLE <span>/// V3</span></h1>
         </div>
+
+        <form method="POST" class="controls">
+            <div style="font-size:12px; color:#888; margin-bottom:5px;">ASSET</div>
+            <input type="text" name="ticker" placeholder="TICKER (e.g. RELIANCE)" value="{{ ticker }}">
+            
+            <div style="font-size:12px; color:#888; margin:10px 0 5px;">STRATEGY & WALLET</div>
+            <div class="row">
+                <select name="horizon">
+                    <option value="1d" {% if horizon == '1d' %}selected{% endif %}>Tomorrow (1D)</option>
+                    <option value="1w" {% if horizon == '1w' %}selected{% endif %}>Next Week (5D)</option>
+                    <option value="1m" {% if horizon == '1m' %}selected{% endif %}>Next Month (20D)</option>
+                </select>
+                <input type="number" name="wallet" placeholder="Wallet (₹)" value="{{ wallet }}">
+            </div>
+            
+            <button type="submit" style="margin-top:10px;">ANALYZE</button>
+            <input type="hidden" name="risk" value="2">
+        </form>
+
+        {% if result and not result.error %}
+        <div class="result-card">
+            <div class="metric-row">
+                <div>
+                    <div class="sub-val">DIRECTION</div>
+                    <div class="big-val {{ result.direction.lower() }}">{{ result.direction }}</div>
+                    <div class="sub-val">{{ result.term }} ({{ result.prob }}%)</div>
+                </div>
+                <div style="text-align:right;">
+                    <div class="sub-val">CURRENT PRICE</div>
+                    <div class="big-val">₹{{ result.last_price }}</div>
+                    <div class="sub-val">ATR: {{ result.atr }}</div>
+                </div>
+            </div>
+
+            <div class="portfolio-box">
+                <div style="color:var(--blue); font-size:12px; font-weight:600; letter-spacing:1px;">AI TRADE ARCHITECT</div>
+                <div class="plan-grid">
+                    <div class="plan-item">
+                        <div>BUY QTY</div>
+                        <div style="color:#fff;">{{ result.qty }}</div>
+                    </div>
+                    <div class="plan-item">
+                        <div>CAPITAL</div>
+                        <div style="color:#fff;">₹{{ result.capital }}</div>
+                    </div>
+                    <div class="plan-item">
+                        <div>ALLOCATION</div>
+                        <div style="color:#fff;">{{ result.wallet_pct }}%</div>
+                    </div>
+                </div>
+                <div class="plan-grid" style="border-top:1px solid rgba(59,130,246,0.3); margin-top:10px; padding-top:10px;">
+                    <div class="plan-item">
+                        <div>STOP LOSS</div>
+                        <div style="color:var(--red);">₹{{ result.stop_loss }}</div>
+                    </div>
+                    <div class="plan-item">
+                        <div>TARGET</div>
+                        <div style="color:var(--green);">₹{{ result.target }}</div>
+                    </div>
+                    <div class="plan-item">
+                        <div>RISK/REWARD</div>
+                        <div style="color:#fff;">1 : 1.5</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chart-box">
+                <canvas id="mainChart"></canvas>
+            </div>
+            
+            <div style="font-size:12px; color:#666; margin-top:15px; border-top:1px solid #333; padding-top:10px;">
+                {{ result.reasoning | safe }}
+            </div>
+        </div>
+        
         <script>
-            const dates = {{ dates | safe }};
-            const prices = {{ prices | safe }};
-            const direction = "{{ prediction }}";
-            const mainColor = direction === 'BULLISH' ? '#34D399' : '#F87171';
-            const ctx = document.getElementById('stockChart').getContext('2d');
-            let gradient = ctx.createLinearGradient(0, 0, 0, 250);
-            gradient.addColorStop(0, mainColor + '40');
-            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            const ctx = document.getElementById('mainChart').getContext('2d');
+            const dates = {{ result.dates | safe }};
+            const prices = {{ result.prices | safe }};
+            const stopLoss = {{ result.stop_loss }};
+            const target = {{ result.target }};
+            const direction = "{{ result.direction }}";
+            
+            // Visual Projection (Blue Dotted Line)
+            const lastPrice = {{ result.last_price }};
+            const atr = {{ result.atr }};
+            let futureLabels = [];
+            let futureData = [];
+            let moveFactor = direction === 'BULLISH' ? 1 : (direction === 'BEARISH' ? -1 : 0);
+            
+            // Project 5 days
+            for(let i=1; i<=5; i++) {
+                futureLabels.push("Proj +" + i + "d");
+                futureData.push(lastPrice + (moveFactor * atr * 0.5 * i));
+            }
+            
+            const allLabels = dates.concat(futureLabels);
+            const histData = prices.concat(new Array(5).fill(null));
+            const projData = new Array(dates.length - 1).fill(null).concat([lastPrice]).concat(futureData);
+
+            let mainColor = direction === 'BULLISH' ? '#34D399' : (direction === 'BEARISH' ? '#F87171' : '#FBBF24');
+
             new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: dates,
-                    datasets: [{
-                        data: prices,
-                        borderColor: mainColor,
-                        backgroundColor: gradient,
-                        borderWidth: 1.5,
-                        pointRadius: 0,
-                        pointHoverRadius: 4,
-                        fill: true,
-                        tension: 0.1
-                    }]
+                    labels: allLabels,
+                    datasets: [
+                        {
+                            label: 'Price',
+                            data: histData,
+                            borderColor: mainColor,
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            tension: 0.1
+                        },
+                        {
+                            label: 'Projection',
+                            data: projData,
+                            borderColor: '#3B82F6',
+                            borderWidth: 2,
+                            borderDash: [5,5],
+                            pointRadius: 0
+                        }
+                    ]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
-                    scales: { x: { display: false }, y: { display: true, position: 'right', grid: { color: '#333', borderDash: [2, 4] }, ticks: { color: '#666', font: { family: 'Inter', size: 10 } } } },
-                    interaction: { mode: 'nearest', axis: 'x', intersect: false }
+                    plugins: { 
+                        annotation: {
+                            annotations: {
+                                line1: {
+                                    type: 'line',
+                                    yMin: stopLoss,
+                                    yMax: stopLoss,
+                                    borderColor: '#F87171',
+                                    borderWidth: 1,
+                                    borderDash: [2,2],
+                                    label: { content: 'STOP', enabled: true, color: '#F87171', position: 'start' }
+                                }
+                            }
+                        },
+                        legend: { display: false } 
+                    },
+                    scales: { 
+                        x: { display: false }, 
+                        y: { position: 'right', grid: { color: '#333' } } 
+                    }
                 }
             });
         </script>
+        {% elif result.error %}
+            <div class="error">System Error: {{ result.error }}</div>
         {% endif %}
     </div>
 </body>
@@ -192,39 +370,23 @@ HTML_TEMPLATE = """
 
 @app.route("/", methods=["GET", "POST"])
 def home():
-    prediction = None
-    confidence = 0
-    error = None
-    ticker_val = ""
-    dates = []
-    prices = []
+    ticker = "RELIANCE.NS"
+    horizon = "1d"
+    wallet = "100000"
+    result = None
 
     if request.method == "POST":
-        raw_input = request.form.get("ticker", "").strip()
-        if not raw_input:
-            error = "Please enter a stock symbol (e.g., ZOMATO)"
-        else:
-            ticker_val = raw_input.upper()
-            if not ticker_val.endswith(".NS") and not ticker_val.endswith(".BO"):
-                ticker_val += ".NS"
+        ticker = request.form.get("ticker", "RELIANCE.NS").upper()
+        if not ticker.endswith(".NS") and not ticker.endswith(".BO") and "-" not in ticker:
+            ticker += ".NS"
             
-            pred, conf_or_err, hist_dates, hist_prices = get_prediction_and_data(ticker_val)
-            
-            if pred:
-                prediction = pred
-                confidence = round(conf_or_err * 100, 1)
-                dates = json.dumps(hist_dates)
-                prices = json.dumps(hist_prices)
-            else:
-                error = conf_or_err
+        wallet = request.form.get("wallet", "100000")
+        horizon = request.form.get("horizon", "1d")
+        
+        # Risk is hardcoded to 2% (Standard Professional Risk)
+        result = get_prediction_and_data(ticker, horizon, "3mo", float(wallet), 2.0)
 
-    return render_template_string(HTML_TEMPLATE, 
-                                  prediction=prediction, 
-                                  confidence=confidence, 
-                                  dates=dates, 
-                                  prices=prices, 
-                                  error=error, 
-                                  ticker=ticker_val.replace(".NS",""))
+    return render_template_string(HTML_TEMPLATE, ticker=ticker.replace(".NS",""), horizon=horizon, wallet=wallet, result=result)
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
