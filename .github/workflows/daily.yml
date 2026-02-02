@@ -3,7 +3,7 @@ name: Daily Retrain
 on:
   schedule:
     - cron: '30 10 * * 1-5' # Runs at 4:00 PM IST (Mon-Fri)
-  workflow_dispatch: # Allows manual button click
+  workflow_dispatch: # Allows manual run
 
 jobs:
   train:
@@ -16,10 +16,9 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.13' # UPDATED: Matches Render's Python version
 
     - name: Install Dependencies
-      # CRITICAL FIX: Install exactly what is in requirements.txt
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
