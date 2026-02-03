@@ -8,6 +8,7 @@ import numpy as np
 import os
 import time
 from datetime import datetime, timedelta
+import pytz 
 
 app = Flask(__name__)
 
@@ -26,13 +27,11 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def add_features(df):
-    # Trend (MACD)
     ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema_12 - ema_26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    # Volatility (Bollinger & ATR)
     sma_20 = df['Close'].rolling(window=20).mean()
     std_20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = sma_20 + (std_20 * 2)
@@ -43,7 +42,6 @@ def add_features(df):
     low_close = abs(df['Low'] - df['Close'].shift())
     df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
 
-    # Patterns
     body_size = abs(df['Close'] - df['Open'])
     full_range = df['High'] - df['Low']
     upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
@@ -52,7 +50,6 @@ def add_features(df):
     df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
     df['Is_Hammer'] = ((lower_shadow >= (body_size * 2)) & (upper_shadow <= (body_size * 0.5))).astype(int)
 
-    # Memory Lags
     for lag in range(1, 6):
         df[f'Return_Lag_{lag}'] = df['Close'].pct_change(lag)
     return df
@@ -92,10 +89,8 @@ def load_history():
         return []
 
 def save_history_to_cloud(history_data):
-    # Save Locally
     with open(HISTORY_FILE, 'w') as f:
         json.dump(history_data, f, indent=4)
-    # Upload to Cloud
     if HF_TOKEN:
         try:
             api = HfApi()
@@ -111,51 +106,74 @@ def save_history_to_cloud(history_data):
 
 def verify_predictions(history):
     """
-    Smart Referee V2:
-    - Checks every 2 Minutes.
-    - Checks only 2 Items per page load (Polite Mode).
+    Smart Referee V6 (Professional Grade):
+    1. Safe Mode: Checks 'lockout.txt' to avoid bans.
+    2. Rate Limit: Checks every 2 mins, max 2 items.
+    3. TIME GATE: Only marks WIN/LOSS if Market Closed (Time > 16:00 IST).
     """
     updated = False
-    today = datetime.now()
-    CHECK_FILE = "last_check.txt"
-    COOLDOWN_MINUTES = 2  # Updated: Check every 2 mins
     
-    # 1. COOLDOWN CHECK
-    if os.path.exists(CHECK_FILE):
-        with open(CHECK_FILE, 'r') as f:
-            try:
-                last_time_str = f.read().strip()
-                last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M:%S')
-                time_diff = (today - last_time).total_seconds() / 60
-                if time_diff < COOLDOWN_MINUTES:
-                    return history # Too soon, skip
-            except: pass
+    # Set Timezone to IST (Indian Standard Time)
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+    
+    CHECK_FILE = "last_check.txt"
+    LOCKOUT_FILE = "lockout.txt"
+    COOLDOWN_MINUTES = 2 
+    LOCKOUT_DURATION = 60 
 
-    # 2. CHECK LOGIC (Limit to 2 items)
+    # 1. EMERGENCY LOCKOUT CHECK
+    if os.path.exists(LOCKOUT_FILE):
+        try:
+            with open(LOCKOUT_FILE, 'r') as f:
+                lockout_time = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
+                if (datetime.now() - lockout_time).total_seconds() / 60 < LOCKOUT_DURATION:
+                    return history
+        except: pass
+
+    # 2. COOLDOWN CHECK
+    if os.path.exists(CHECK_FILE):
+        try:
+            with open(CHECK_FILE, 'r') as f:
+                last_time = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
+                if (datetime.now() - last_time).total_seconds() / 60 < COOLDOWN_MINUTES:
+                    return history
+        except: pass
+
+    # 3. VERIFICATION LOGIC
     check_count = 0
     
     for entry in history:
-        if check_count >= 2: break # Strict Limit
+        if check_count >= 2: break
         
         if entry.get('Status') == "Pending":
             try:
                 pred_date = datetime.strptime(entry['Date'], '%Y-%m-%d')
-                days_passed = (today - pred_date).days
+                days_passed = (now_ist.replace(tzinfo=None) - pred_date).days
                 
+                # Determine Target Date
                 required_days = 1
                 if entry['Horizon'] == '1w': required_days = 5
                 elif entry['Horizon'] == '1m': required_days = 20
                 
-                if days_passed >= required_days:
+                # PROFESSIONAL CHECK:
+                # If we are ON the target day, has the market closed yet?
+                # If days_passed == required_days, we must wait until 4:00 PM (16:00)
+                is_target_day = (days_passed == required_days)
+                market_closed = (now_ist.hour >= 16)
+
+                # Only verify if target date passed OR (it is target date AND market is closed)
+                if days_passed > required_days or (is_target_day and market_closed):
+                    
                     time.sleep(1) # Polite Delay
                     
                     ticker = entry['Ticker']
                     stock = yf.Ticker(ticker)
-                    hist = stock.history(start=pred_date, end=today)
+                    hist = stock.history(period="1mo") # Fetch recent data
                     
                     if not hist.empty:
-                        idx = min(required_days, len(hist)-1)
-                        result_price = hist.iloc[idx]['Close']
+                        # Find the Close price on or after target date
+                        result_price = hist.iloc[-1]['Close']
                         entry['Exit_Price'] = round(result_price, 2)
                         
                         if entry['Direction'] == "BULLISH":
@@ -166,16 +184,20 @@ def verify_predictions(history):
                             else: entry['Status'] = "❌ LOSS"
                         else:
                             entry['Status'] = "⚪ NEUTRAL"
-                            
                         updated = True
                         check_count += 1
+                        
             except Exception as e:
-                print(f"Verify Error: {e}")
+                error_msg = str(e)
+                if "Too Many Requests" in error_msg or "429" in error_msg:
+                    with open(LOCKOUT_FILE, 'w') as f:
+                        f.write(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    break
                 break
 
-    # 3. RESET TIMER
+    # 4. RESET TIMER
     with open(CHECK_FILE, 'w') as f:
-        f.write(today.strftime('%Y-%m-%d %H:%M:%S'))
+        f.write(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
     if updated:
         save_history_to_cloud(history)
@@ -185,7 +207,6 @@ def log_prediction(ticker, horizon, direction, prob, price, target, stop_loss):
     history = load_history()
     today = datetime.now().strftime('%Y-%m-%d')
     
-    # Check duplicate
     for entry in history:
         if entry['Date'] == today and entry['Ticker'] == ticker and entry['Horizon'] == horizon:
             return 
@@ -214,7 +235,7 @@ def home():
     wallet = "100000"
     result = None
     
-    # Verify History (Every 2 mins)
+    # Run Smart Referee
     history = load_history()
     history = verify_predictions(history) 
 
@@ -227,27 +248,23 @@ def home():
         horizon = request.form.get("horizon", "1d")
         
         result = get_prediction_and_data(ticker, horizon, "3mo", float(wallet), 2.0)
-        history = load_history() # Reload to see new entry
+        history = load_history() 
 
     return render_template_string(HTML_TEMPLATE, ticker=ticker.replace(".NS",""), horizon=horizon, wallet=wallet, result=result, history=history)
 
 @app.route("/delete", methods=["POST"])
 def delete_entries():
-    # Get list of checked items (Format: "Date|Ticker|Horizon")
     items_to_delete = request.form.getlist("selected_logs")
-    
     if items_to_delete:
         history = load_history()
-        # Filter: Keep items that are NOT in the delete list
         new_history = [
             entry for entry in history 
             if f"{entry['Date']}|{entry['Ticker']}|{entry['Horizon']}" not in items_to_delete
         ]
         save_history_to_cloud(new_history)
-        
     return redirect(url_for('home'))
 
-# --- 4. PREDICTION ENGINE (Helper) ---
+# --- 4. PREDICTION ENGINE ---
 def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=100000, risk=2):
     try:
         model_filename = f"model_{horizon}.pkl"
@@ -291,7 +308,6 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
             final_prob = (1 - prob_score) * 100
             
         reasoning = generate_reasoning(latest.iloc[0])
-
         current_price = latest['Close'].values[0]
         current_atr = latest['ATR'].values[0]
         qty, capital, sl_dist = calculate_position_size(float(wallet), float(risk), current_price, current_atr)
@@ -323,18 +339,17 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
             "stop_loss": round(sl_price, 2),
             "target": round(target_price, 2)
         }
-        
     except Exception as e:
         return {"error": str(e)}
 
-# --- 5. HTML FRONTEND (V5) ---
+# --- 5. HTML FRONTEND ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Oracle V5</title>
+    <title>Oracle V6</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -383,7 +398,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="app">
         <div class="header">
-            <h1>ORACLE <span>/// V5</span></h1>
+            <h1>ORACLE <span>/// V6</span></h1>
         </div>
 
         <form method="POST" class="controls">
@@ -512,6 +527,9 @@ HTML_TEMPLATE = """
                         <option value="LOSS">Losses Only</option>
                         <option value="Pending">Pending</option>
                     </select>
+                    <input type="date" id="startDate" onchange="filterHistory()" placeholder="From Date">
+                    <input type="date" id="endDate" onchange="filterHistory()" placeholder="To Date">
+                    
                     <button type="submit" class="del-btn" onclick="return confirm('Delete selected logs?')">DELETE SELECTED</button>
                 </div>
 
@@ -550,20 +568,34 @@ HTML_TEMPLATE = """
             var input = document.getElementById("searchBox");
             var filter = input.value.toUpperCase();
             var statusFilter = document.getElementById("statusFilter").value;
+            
+            // DATE FILTER LOGIC
+            var startDateVal = document.getElementById("startDate").value;
+            var endDateVal = document.getElementById("endDate").value;
+            var startDate = startDateVal ? new Date(startDateVal) : null;
+            var endDate = endDateVal ? new Date(endDateVal) : null;
+
             var table = document.getElementById("historyTable");
             var tr = table.getElementsByTagName("tr");
 
             for (var i = 1; i < tr.length; i++) {
+                var dateTd = tr[i].getElementsByClassName("date-cell")[0];
                 var tickerTd = tr[i].getElementsByClassName("ticker-cell")[0];
                 var statusTd = tr[i].getElementsByClassName("status-cell")[0];
                 
-                if (tickerTd && statusTd) {
+                if (dateTd && tickerTd && statusTd) {
+                    var dateValue = new Date(dateTd.textContent || dateTd.innerText);
                     var txtValue = tickerTd.textContent || tickerTd.innerText;
                     var statusValue = statusTd.textContent || statusTd.innerText;
+                    
                     var matchesSearch = txtValue.toUpperCase().indexOf(filter) > -1;
                     var matchesStatus = (statusFilter === "all") || (statusValue.indexOf(statusFilter) > -1);
                     
-                    if (matchesSearch && matchesStatus) {
+                    var matchesDate = true;
+                    if (startDate) { if (dateValue < startDate) matchesDate = false; }
+                    if (endDate) { if (dateValue > endDate) matchesDate = false; }
+                    
+                    if (matchesSearch && matchesStatus && matchesDate) {
                         tr[i].style.display = "";
                     } else {
                         tr[i].style.display = "none";
@@ -602,6 +634,5 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
-
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
