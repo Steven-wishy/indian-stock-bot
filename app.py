@@ -5,11 +5,14 @@ import json
 import pandas as pd
 from huggingface_hub import hf_hub_download
 import numpy as np
+import os
+from datetime import datetime
 
 app = Flask(__name__)
 
 REPO_ID = "Shakuji/stock-predictor-model" 
 MARKET_INDEX = "^NSEI"
+HISTORY_FILE = "prediction_history.csv"
 
 # --- MATH & FEATURE LOGIC ---
 def calculate_rsi(series, period=14):
@@ -49,37 +52,68 @@ def add_features(df):
 
 def generate_reasoning(row):
     reasons = []
-    # RSI
     if row['RSI'] > 70: reasons.append("⚠️ <b>RSI Overbought:</b> Risk of Pullback.")
     elif row['RSI'] < 30: reasons.append("💎 <b>RSI Oversold:</b> Potential Value Zone.")
     else: reasons.append("✅ <b>RSI Neutral:</b> Safe zone.")
     
-    # MACD
     if row['MACD'] > row['MACD_Signal']: reasons.append("🚀 <b>MACD Bullish:</b> Momentum is Positive.")
     else: reasons.append("📉 <b>MACD Bearish:</b> Momentum is Negative.")
     
-    # Bollinger
-    if row['Close'] > row['BB_Upper']: reasons.append("⚠️ <b>Bollinger High:</b> Price extended above bands.")
-    elif row['Close'] < row['BB_Lower']: reasons.append("🛡️ <b>Bollinger Low:</b> Price at support band.")
+    if row['Close'] > row['BB_Upper']: reasons.append("⚠️ <b>Bollinger High:</b> Price extended.")
+    elif row['Close'] < row['BB_Lower']: reasons.append("🛡️ <b>Bollinger Low:</b> Price at support.")
 
     return "<br>".join(reasons)
 
 def calculate_position_size(wallet, risk_per_trade, price, atr):
-    # Professional Risk Formula: Risk / (2 * ATR)
     risk_amount = wallet * (risk_per_trade / 100)
     sl_distance = 2 * atr
-    
     if sl_distance == 0: return 0, 0, 0
-    
     qty = int(risk_amount / sl_distance)
-    
-    # Safety Cap: Max 25% of wallet on one stock
     max_alloc = wallet * 0.25
-    if (qty * price) > max_alloc:
-        qty = int(max_alloc / price)
-        
+    if (qty * price) > max_alloc: qty = int(max_alloc / price)
     capital = qty * price
     return qty, capital, sl_distance
+
+# --- HISTORY LOGGING SYSTEM ---
+def log_prediction(ticker, horizon, direction, prob, price, target, stop_loss):
+    today = datetime.now().strftime('%Y-%m-%d')
+    new_row = {
+        'Date': today,
+        'Ticker': ticker,
+        'Horizon': horizon,
+        'Direction': direction,
+        'Confidence': f"{prob}%",
+        'Entry_Price': price,
+        'Target': target,
+        'Stop_Loss': stop_loss
+    }
+    
+    # Create file if not exists
+    if not os.path.exists(HISTORY_FILE):
+        df = pd.DataFrame([new_row])
+        df.to_csv(HISTORY_FILE, index=False)
+    else:
+        df = pd.read_csv(HISTORY_FILE)
+        # Check for duplicates (Same Date + Ticker + Horizon) to avoid spamming
+        duplicate = df[
+            (df['Date'] == today) & 
+            (df['Ticker'] == ticker) & 
+            (df['Horizon'] == horizon)
+        ]
+        
+        if duplicate.empty:
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            df.to_csv(HISTORY_FILE, index=False)
+
+def get_ticker_history(ticker):
+    if not os.path.exists(HISTORY_FILE): return []
+    try:
+        df = pd.read_csv(HISTORY_FILE)
+        # Filter by ticker and sort by date descending
+        ticker_df = df[df['Ticker'] == ticker].sort_values(by='Date', ascending=False)
+        return ticker_df.to_dict('records')
+    except:
+        return []
 
 def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=100000, risk=2):
     try:
@@ -91,13 +125,11 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
         df = stock.history(period="2y") 
         if df.empty or len(df) < 60: return None
 
-        # Filter Graph Data
         graph_days = 90
         if graph_range == "1mo": graph_days = 30
         elif graph_range == "6mo": graph_days = 180
         elif graph_range == "1y": graph_days = 365
         
-        # Calculate Features
         df["SMA_10"] = df["Close"].rolling(window=10).mean()
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["RSI"] = calculate_rsi(df["Close"])
@@ -106,7 +138,6 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
         
         latest = df.iloc[-1:].copy()
         
-        # Predict
         features = ["SMA_10", "SMA_50", "RSI", "Volatility", "MACD", "MACD_Signal", 
                     "BB_Upper", "BB_Lower", "ATR", "Is_Doji", "Is_Hammer"]
         features += [f'Return_Lag_{i}' for i in range(1, 6)]
@@ -114,7 +145,6 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
         input_df = pd.DataFrame(latest[features].values, columns=features)
         prob_score = model.predict_proba(input_df)[0][1]
 
-        # Traffic Light Logic
         if 0.45 <= prob_score <= 0.55:
             direction = "NEUTRAL"
             term = "Wait / Unsure"
@@ -130,12 +160,10 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
             
         reasoning = generate_reasoning(latest.iloc[0])
 
-        # Portfolio Calc
         current_price = latest['Close'].values[0]
         current_atr = latest['ATR'].values[0]
         qty, capital, sl_dist = calculate_position_size(float(wallet), float(risk), current_price, current_atr)
         
-        # Set Targets
         if direction == "BULLISH":
             sl_price = current_price - sl_dist
             target_price = current_price + (sl_dist * 1.5)
@@ -143,6 +171,9 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
             sl_price = current_price + sl_dist
             target_price = current_price - (sl_dist * 1.5)
             
+        # --- LOG THE PREDICTION ---
+        log_prediction(ticker, horizon, direction, round(final_prob, 1), round(current_price, 2), round(target_price, 2), round(sl_price, 2))
+
         dates = df.index.strftime('%d %b').tolist()[-graph_days:] 
         prices = df['Close'].round(2).tolist()[-graph_days:]
 
@@ -172,7 +203,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Oracle V3 /// Portfolio Architect</title>
+    <title>Oracle V3 /// History</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -198,6 +229,11 @@ HTML_TEMPLATE = """
         .plan-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center; margin-top: 10px; }
         .plan-item div:first-child { font-size: 11px; color: var(--text-muted); }
         .plan-item div:last-child { font-size: 16px; font-weight: 600; }
+
+        .history-table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }
+        .history-table th { text-align: left; color: var(--text-muted); padding: 8px; border-bottom: 1px solid var(--border); }
+        .history-table td { padding: 8px; border-bottom: 1px solid #222; }
+        .history-title { font-size: 14px; font-weight: 600; margin-top: 30px; letter-spacing: 1px; color: var(--text-muted); }
 
         .chart-box { height: 250px; position: relative; margin-top: 20px; }
         .error { color: var(--red); padding: 10px; background: rgba(248,113,113,0.1); }
@@ -291,15 +327,12 @@ HTML_TEMPLATE = """
             const stopLoss = {{ result.stop_loss }};
             const target = {{ result.target }};
             const direction = "{{ result.direction }}";
-            
-            // Visual Projection (Blue Dotted Line)
             const lastPrice = {{ result.last_price }};
             const atr = {{ result.atr }};
             let futureLabels = [];
             let futureData = [];
             let moveFactor = direction === 'BULLISH' ? 1 : (direction === 'BEARISH' ? -1 : 0);
             
-            // Project 5 days
             for(let i=1; i<=5; i++) {
                 futureLabels.push("Proj +" + i + "d");
                 futureData.push(lastPrice + (moveFactor * atr * 0.5 * i));
@@ -360,6 +393,33 @@ HTML_TEMPLATE = """
                 }
             });
         </script>
+
+        {% if history %}
+        <div class="history-title">PAST PREDICTIONS ({{ ticker }})</div>
+        <table class="history-table">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Horiz</th>
+                    <th>Signal</th>
+                    <th>Entry</th>
+                    <th>Result?</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in history %}
+                <tr>
+                    <td style="color:#888;">{{ row.Date }}</td>
+                    <td>{{ row.Horizon }}</td>
+                    <td class="{{ 'bullish' if row.Direction == 'BULLISH' else 'bearish' if row.Direction == 'BEARISH' else 'neutral' }}">{{ row.Direction }}</td>
+                    <td>₹{{ row.Entry_Price }}</td>
+                    <td style="color:#555;">(Pending)</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+
         {% elif result.error %}
             <div class="error">System Error: {{ result.error }}</div>
         {% endif %}
@@ -374,6 +434,7 @@ def home():
     horizon = "1d"
     wallet = "100000"
     result = None
+    history = []
 
     if request.method == "POST":
         ticker = request.form.get("ticker", "RELIANCE.NS").upper()
@@ -383,10 +444,12 @@ def home():
         wallet = request.form.get("wallet", "100000")
         horizon = request.form.get("horizon", "1d")
         
-        # Risk is hardcoded to 2% (Standard Professional Risk)
         result = get_prediction_and_data(ticker, horizon, "3mo", float(wallet), 2.0)
+    
+    # Always fetch history for the current ticker (GET or POST)
+    history = get_ticker_history(ticker)
 
-    return render_template_string(HTML_TEMPLATE, ticker=ticker.replace(".NS",""), horizon=horizon, wallet=wallet, result=result)
+    return render_template_string(HTML_TEMPLATE, ticker=ticker.replace(".NS",""), horizon=horizon, wallet=wallet, result=result, history=history)
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
