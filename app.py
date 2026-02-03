@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, redirect, url_for
 import yfinance as yf
 import joblib
 import json
@@ -6,6 +6,7 @@ import pandas as pd
 from huggingface_hub import hf_hub_download, HfApi
 import numpy as np
 import os
+import time
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -14,7 +15,6 @@ app = Flask(__name__)
 REPO_ID = "Shakuji/stock-predictor-model" 
 MARKET_INDEX = "^NSEI"
 HISTORY_FILE = "history.json"
-# IMPORTANT: Ensure 'HF_TOKEN' is set in your Render Environment Variables
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 # --- 1. MATH & INDICATOR LOGIC ---
@@ -72,24 +72,18 @@ def generate_reasoning(row):
     return "<br>".join(reasons)
 
 def calculate_position_size(wallet, risk_per_trade, price, atr):
-    # Professional Risk Management
     risk_amount = wallet * (risk_per_trade / 100)
     sl_distance = 2 * atr
     if sl_distance == 0: return 0, 0, 0
-    
     qty = int(risk_amount / sl_distance)
-    
-    # Cap at 25% of wallet
     max_alloc = wallet * 0.25
     if (qty * price) > max_alloc: qty = int(max_alloc / price)
-    
     capital = qty * price
     return qty, capital, sl_distance
 
 # --- 2. CLOUD HISTORY & VERIFICATION SYSTEM ---
 
 def load_history():
-    """Downloads history.json from Hugging Face. Creates empty list if missing."""
     try:
         path = hf_hub_download(repo_id=REPO_ID, filename=HISTORY_FILE, repo_type="model")
         with open(path, 'r') as f:
@@ -98,12 +92,10 @@ def load_history():
         return []
 
 def save_history_to_cloud(history_data):
-    """Saves locally AND uploads to Hugging Face for persistence."""
-    # 1. Save Locally
+    # Save Locally
     with open(HISTORY_FILE, 'w') as f:
         json.dump(history_data, f, indent=4)
-    
-    # 2. Upload to Cloud
+    # Upload to Cloud
     if HF_TOKEN:
         try:
             api = HfApi()
@@ -118,37 +110,54 @@ def save_history_to_cloud(history_data):
             print(f"Cloud Upload Failed: {e}")
 
 def verify_predictions(history):
-    """The 'Referee': Checks old predictions against real prices."""
+    """
+    Smart Referee V2:
+    - Checks every 2 Minutes.
+    - Checks only 2 Items per page load (Polite Mode).
+    """
     updated = False
     today = datetime.now()
+    CHECK_FILE = "last_check.txt"
+    COOLDOWN_MINUTES = 2  # Updated: Check every 2 mins
+    
+    # 1. COOLDOWN CHECK
+    if os.path.exists(CHECK_FILE):
+        with open(CHECK_FILE, 'r') as f:
+            try:
+                last_time_str = f.read().strip()
+                last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M:%S')
+                time_diff = (today - last_time).total_seconds() / 60
+                if time_diff < COOLDOWN_MINUTES:
+                    return history # Too soon, skip
+            except: pass
+
+    # 2. CHECK LOGIC (Limit to 2 items)
+    check_count = 0
     
     for entry in history:
-        # Only check if still Pending
+        if check_count >= 2: break # Strict Limit
+        
         if entry.get('Status') == "Pending":
             try:
                 pred_date = datetime.strptime(entry['Date'], '%Y-%m-%d')
                 days_passed = (today - pred_date).days
                 
-                # Determine how long we wait before judging
                 required_days = 1
                 if entry['Horizon'] == '1w': required_days = 5
                 elif entry['Horizon'] == '1m': required_days = 20
                 
-                # If enough time passed, check result
                 if days_passed >= required_days:
+                    time.sleep(1) # Polite Delay
+                    
                     ticker = entry['Ticker']
                     stock = yf.Ticker(ticker)
-                    # Get price history from prediction date to today
                     hist = stock.history(start=pred_date, end=today)
                     
                     if not hist.empty:
-                        # Get closing price at the end of the period
-                        # We use min(required_days, len) to avoid errors if data is short
                         idx = min(required_days, len(hist)-1)
                         result_price = hist.iloc[idx]['Close']
                         entry['Exit_Price'] = round(result_price, 2)
                         
-                        # Determine WIN or LOSS
                         if entry['Direction'] == "BULLISH":
                             if result_price > entry['Entry_Price']: entry['Status'] = "✅ WIN"
                             else: entry['Status'] = "❌ LOSS"
@@ -159,9 +168,15 @@ def verify_predictions(history):
                             entry['Status'] = "⚪ NEUTRAL"
                             
                         updated = True
+                        check_count += 1
             except Exception as e:
-                print(f"Verification Check Failed for {entry['Ticker']}: {e}")
-                    
+                print(f"Verify Error: {e}")
+                break
+
+    # 3. RESET TIMER
+    with open(CHECK_FILE, 'w') as f:
+        f.write(today.strftime('%Y-%m-%d %H:%M:%S'))
+
     if updated:
         save_history_to_cloud(history)
     return history
@@ -170,10 +185,10 @@ def log_prediction(ticker, horizon, direction, prob, price, target, stop_loss):
     history = load_history()
     today = datetime.now().strftime('%Y-%m-%d')
     
-    # Prevent Duplicates (Same Ticker + Same Horizon + Same Day)
+    # Check duplicate
     for entry in history:
         if entry['Date'] == today and entry['Ticker'] == ticker and entry['Horizon'] == horizon:
-            return # Already logged today
+            return 
             
     new_entry = {
         'Date': today,
@@ -187,40 +202,74 @@ def log_prediction(ticker, horizon, direction, prob, price, target, stop_loss):
         'Stop_Loss': stop_loss,
         'Status': "Pending" 
     }
-    
-    # Add to top of list
     history.insert(0, new_entry)
     save_history_to_cloud(history)
 
-# --- 3. MAIN PREDICTION ENGINE ---
+# --- 3. FLASK ROUTES ---
+
+@app.route("/", methods=["GET", "POST"])
+def home():
+    ticker = "RELIANCE.NS"
+    horizon = "1d"
+    wallet = "100000"
+    result = None
+    
+    # Verify History (Every 2 mins)
+    history = load_history()
+    history = verify_predictions(history) 
+
+    if request.method == "POST":
+        ticker = request.form.get("ticker", "RELIANCE.NS").upper()
+        if not ticker.endswith(".NS") and not ticker.endswith(".BO") and "-" not in ticker:
+            ticker += ".NS"
+            
+        wallet = request.form.get("wallet", "100000")
+        horizon = request.form.get("horizon", "1d")
+        
+        result = get_prediction_and_data(ticker, horizon, "3mo", float(wallet), 2.0)
+        history = load_history() # Reload to see new entry
+
+    return render_template_string(HTML_TEMPLATE, ticker=ticker.replace(".NS",""), horizon=horizon, wallet=wallet, result=result, history=history)
+
+@app.route("/delete", methods=["POST"])
+def delete_entries():
+    # Get list of checked items (Format: "Date|Ticker|Horizon")
+    items_to_delete = request.form.getlist("selected_logs")
+    
+    if items_to_delete:
+        history = load_history()
+        # Filter: Keep items that are NOT in the delete list
+        new_history = [
+            entry for entry in history 
+            if f"{entry['Date']}|{entry['Ticker']}|{entry['Horizon']}" not in items_to_delete
+        ]
+        save_history_to_cloud(new_history)
+        
+    return redirect(url_for('home'))
+
+# --- 4. PREDICTION ENGINE (Helper) ---
 def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=100000, risk=2):
     try:
-        # Download Model
         model_filename = f"model_{horizon}.pkl"
         model_path = hf_hub_download(repo_id=REPO_ID, filename=model_filename)
         model = joblib.load(model_path)
         
-        # Get Data
         stock = yf.Ticker(ticker)
         df = stock.history(period="2y") 
         if df.empty or len(df) < 60: return None
 
-        # Prep Graph Data
         graph_days = 90
         if graph_range == "1mo": graph_days = 30
         elif graph_range == "6mo": graph_days = 180
         elif graph_range == "1y": graph_days = 365
         
-        # Feature Engineering
         df["SMA_10"] = df["Close"].rolling(window=10).mean()
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["RSI"] = calculate_rsi(df["Close"])
         df["Volatility"] = df["Close"].rolling(window=10).std()
         df = add_features(df)
-        
         latest = df.iloc[-1:].copy()
         
-        # Predict
         features = ["SMA_10", "SMA_50", "RSI", "Volatility", "MACD", "MACD_Signal", 
                     "BB_Upper", "BB_Lower", "ATR", "Is_Doji", "Is_Hammer"]
         features += [f'Return_Lag_{i}' for i in range(1, 6)]
@@ -228,7 +277,6 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
         input_df = pd.DataFrame(latest[features].values, columns=features)
         prob_score = model.predict_proba(input_df)[0][1]
 
-        # Logic
         if 0.45 <= prob_score <= 0.55:
             direction = "NEUTRAL"
             term = "Wait / Unsure"
@@ -244,7 +292,6 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
             
         reasoning = generate_reasoning(latest.iloc[0])
 
-        # Portfolio Math
         current_price = latest['Close'].values[0]
         current_atr = latest['ATR'].values[0]
         qty, capital, sl_dist = calculate_position_size(float(wallet), float(risk), current_price, current_atr)
@@ -256,7 +303,6 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
             sl_price = current_price + sl_dist
             target_price = current_price - (sl_dist * 1.5)
             
-        # Log to History
         log_prediction(ticker, horizon, direction, round(final_prob, 1), round(current_price, 2), round(target_price, 2), round(sl_price, 2))
 
         dates = df.index.strftime('%d %b').tolist()[-graph_days:] 
@@ -281,14 +327,14 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
     except Exception as e:
         return {"error": str(e)}
 
-# --- 4. HTML FRONTEND (V4) ---
+# --- 5. HTML FRONTEND (V5) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Oracle V4</title>
+    <title>Oracle V5</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -320,12 +366,12 @@ HTML_TEMPLATE = """
         
         /* History & Filter Styles */
         .history-section { margin-top: 40px; }
-        .history-controls { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
+        .history-controls { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center;}
         .history-controls input, .history-controls select { padding: 8px; font-size: 12px; flex: 1; min-width: 100px; }
+        .del-btn { background: var(--red); color: #fff; border: none; padding: 8px 15px; cursor: pointer; font-weight: 600; font-size: 12px; flex: 0 0 auto; min-width: auto; }
         
         .history-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        .history-table th { text-align: left; color: var(--text-muted); padding: 8px; border-bottom: 1px solid var(--border); cursor:pointer; user-select: none; }
-        .history-table th:hover { color: #fff; }
+        .history-table th { text-align: left; color: var(--text-muted); padding: 8px; border-bottom: 1px solid var(--border); cursor:pointer; }
         .history-table td { padding: 8px; border-bottom: 1px solid #222; }
         .status-win { color: var(--green); font-weight: bold; }
         .status-loss { color: var(--red); font-weight: bold; }
@@ -337,7 +383,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="app">
         <div class="header">
-            <h1>ORACLE <span>/// V4</span></h1>
+            <h1>ORACLE <span>/// V5</span></h1>
         </div>
 
         <form method="POST" class="controls">
@@ -455,80 +501,69 @@ HTML_TEMPLATE = """
         {% endif %}
 
         <div class="history-section">
-            <div style="font-size:14px; font-weight:600; margin-bottom:10px; color:#888;">PREDICTION LOG</div>
+            <div style="font-size:14px; font-weight:600; margin-bottom:10px; color:#888;">LOG MANAGER</div>
             
-            <div class="history-controls">
-                <input type="text" id="searchBox" onkeyup="filterHistory()" placeholder="Search Ticker..." style="background:#111; border:1px solid #333; color:#fff;">
-                <select id="statusFilter" onchange="filterHistory()" style="background:#111; border:1px solid #333; color:#fff;">
-                    <option value="all">All Status</option>
-                    <option value="WIN">Wins Only</option>
-                    <option value="LOSS">Losses Only</option>
-                    <option value="Pending">Pending</option>
-                </select>
-                <input type="date" id="startDate" onchange="filterHistory()" style="background:#111; border:1px solid #333; color:#fff;">
-                <input type="date" id="endDate" onchange="filterHistory()" style="background:#111; border:1px solid #333; color:#fff;">
-            </div>
+            <form action="/delete" method="POST">
+                <div class="history-controls">
+                    <input type="text" id="searchBox" onkeyup="filterHistory()" placeholder="Search Ticker...">
+                    <select id="statusFilter" onchange="filterHistory()">
+                        <option value="all">All Status</option>
+                        <option value="WIN">Wins Only</option>
+                        <option value="LOSS">Losses Only</option>
+                        <option value="Pending">Pending</option>
+                    </select>
+                    <button type="submit" class="del-btn" onclick="return confirm('Delete selected logs?')">DELETE SELECTED</button>
+                </div>
 
-            <table class="history-table" id="historyTable">
-                <thead>
-                    <tr>
-                        <th onclick="sortTable(0)">Date ⬍</th>
-                        <th onclick="sortTable(1)">Ticker ⬍</th>
-                        <th>Signal</th>
-                        <th>Entry</th>
-                        <th>Exit</th>
-                        <th onclick="sortTable(5)">Result ⬍</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for row in history %}
-                    <tr class="history-row">
-                        <td class="date-cell" style="color:#666;">{{ row.Date }}</td>
-                        <td class="ticker-cell">{{ row.Ticker }}</td>
-                        <td class="{{ 'bullish' if row.Direction == 'BULLISH' else 'bearish' if row.Direction == 'BEARISH' else 'neutral' }}">{{ row.Direction }}</td>
-                        <td>{{ row.Entry_Price }}</td>
-                        <td>{{ row.Exit_Price }}</td>
-                        <td class="status-cell {{ 'status-win' if 'WIN' in row.Status else 'status-loss' if 'LOSS' in row.Status else 'status-pending' }}">{{ row.Status }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+                <table class="history-table" id="historyTable">
+                    <thead>
+                        <tr>
+                            <th width="30">✔</th>
+                            <th onclick="sortTable(1)">Date ⬍</th>
+                            <th onclick="sortTable(2)">Ticker ⬍</th>
+                            <th>Signal</th>
+                            <th>Entry</th>
+                            <th>Exit</th>
+                            <th onclick="sortTable(6)">Result ⬍</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in history %}
+                        <tr class="history-row">
+                            <td><input type="checkbox" name="selected_logs" value="{{ row.Date }}|{{ row.Ticker }}|{{ row.Horizon }}"></td>
+                            <td class="date-cell" style="color:#666;">{{ row.Date }}</td>
+                            <td class="ticker-cell">{{ row.Ticker }}</td>
+                            <td class="{{ 'bullish' if row.Direction == 'BULLISH' else 'bearish' if row.Direction == 'BEARISH' else 'neutral' }}">{{ row.Direction }}</td>
+                            <td>{{ row.Entry_Price }}</td>
+                            <td>{{ row.Exit_Price }}</td>
+                            <td class="status-cell {{ 'status-win' if 'WIN' in row.Status else 'status-loss' if 'LOSS' in row.Status else 'status-pending' }}">{{ row.Status }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </form>
         </div>
     </div>
 
     <script>
-        // --- FILTER LOGIC ---
         function filterHistory() {
             var input = document.getElementById("searchBox");
             var filter = input.value.toUpperCase();
             var statusFilter = document.getElementById("statusFilter").value;
-            
-            var startDateVal = document.getElementById("startDate").value;
-            var endDateVal = document.getElementById("endDate").value;
-            var startDate = startDateVal ? new Date(startDateVal) : null;
-            var endDate = endDateVal ? new Date(endDateVal) : null;
-
             var table = document.getElementById("historyTable");
             var tr = table.getElementsByTagName("tr");
 
             for (var i = 1; i < tr.length; i++) {
-                var dateTd = tr[i].getElementsByClassName("date-cell")[0];
                 var tickerTd = tr[i].getElementsByClassName("ticker-cell")[0];
                 var statusTd = tr[i].getElementsByClassName("status-cell")[0];
                 
-                if (dateTd && tickerTd && statusTd) {
-                    var dateValue = new Date(dateTd.textContent || dateTd.innerText);
+                if (tickerTd && statusTd) {
                     var txtValue = tickerTd.textContent || tickerTd.innerText;
                     var statusValue = statusTd.textContent || statusTd.innerText;
-                    
                     var matchesSearch = txtValue.toUpperCase().indexOf(filter) > -1;
                     var matchesStatus = (statusFilter === "all") || (statusValue.indexOf(statusFilter) > -1);
                     
-                    var matchesDate = true;
-                    if (startDate) { if (dateValue < startDate) matchesDate = false; }
-                    if (endDate) { if (dateValue > endDate) matchesDate = false; }
-                    
-                    if (matchesSearch && matchesStatus && matchesDate) {
+                    if (matchesSearch && matchesStatus) {
                         tr[i].style.display = "";
                     } else {
                         tr[i].style.display = "none";
@@ -536,8 +571,6 @@ HTML_TEMPLATE = """
                 }       
             }
         }
-
-        // --- SORT LOGIC ---
         function sortTable(n) {
           var table, rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
           table = document.getElementById("historyTable");
@@ -569,33 +602,6 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
-
-# --- 5. FLASK ROUTE ---
-@app.route("/", methods=["GET", "POST"])
-def home():
-    ticker = "RELIANCE.NS"
-    horizon = "1d"
-    wallet = "100000"
-    result = None
-    
-    # Auto-Verification on Load
-    history = load_history()
-    history = verify_predictions(history) 
-
-    if request.method == "POST":
-        ticker = request.form.get("ticker", "RELIANCE.NS").upper()
-        if not ticker.endswith(".NS") and not ticker.endswith(".BO") and "-" not in ticker:
-            ticker += ".NS"
-            
-        wallet = request.form.get("wallet", "100000")
-        horizon = request.form.get("horizon", "1d")
-        
-        result = get_prediction_and_data(ticker, horizon, "3mo", float(wallet), 2.0)
-        
-        # Refresh history to include new log
-        history = load_history()
-
-    return render_template_string(HTML_TEMPLATE, ticker=ticker.replace(".NS",""), horizon=horizon, wallet=wallet, result=result, history=history)
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
