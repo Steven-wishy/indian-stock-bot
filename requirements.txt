@@ -1,4 +1,4 @@
-flask
+flask                             
 gunicorn
 yfinance
 pandas
@@ -7,3 +7,4 @@ scikit-learn==1.5.0
 xgboost==2.0.3
 joblib
 huggingface_hub
+pytz
