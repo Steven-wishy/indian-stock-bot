@@ -18,7 +18,7 @@ MARKET_INDEX = "^NSEI"
 HISTORY_FILE = "history.json"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# --- 1. MATH & INDICATOR LOGIC ---
+# --- 1. MATH & INDICATOR LOGIC (FULL SUITE) ---
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -27,12 +27,13 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def add_features(df):
-    # Standard Indicators for Display
+    # 1. Trend (MACD)
     ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema_12 - ema_26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
+    # 2. Volatility (Bollinger Bands & ATR)
     sma_20 = df['Close'].rolling(window=20).mean()
     std_20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = sma_20 + (std_20 * 2)
@@ -43,14 +44,24 @@ def add_features(df):
     low_close = abs(df['Low'] - df['Close'].shift())
     df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
 
-    # --- CRITICAL: FEATURES FOR VOTING CLASSIFIER ---
-    # These must match train_model.py EXACTLY
+    # 3. Candlestick Patterns
+    body_size = abs(df['Close'] - df['Open'])
+    full_range = df['High'] - df['Low']
+    upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
+    lower_shadow = df[['Open', 'Close']].min(axis=1) - df['Low']
+    
+    df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
+    df['Is_Hammer'] = ((lower_shadow >= (body_size * 2)) & (upper_shadow <= (body_size * 0.5))).astype(int)
+    
+    # 4. Standard Moving Averages & Volatility
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     df['Volatility'] = df['Close'].rolling(window=10).std()
-    df['Prev_Close'] = df['Close'].shift(1)
-    df['Return'] = (df['Close'] - df['Prev_Close']) / df['Prev_Close']
 
+    # 5. Memory Lags (CRITICAL FOR V8)
+    for lag in range(1, 6):
+        df[f'Return_Lag_{lag}'] = df['Close'].pct_change(lag)
+        
     return df
 
 def generate_reasoning(row):
@@ -104,12 +115,6 @@ def save_history_to_cloud(history_data):
             print(f"Cloud Upload Failed: {e}")
 
 def verify_predictions(history):
-    """
-    Smart Referee V6 (Professional Grade):
-    1. Safe Mode: Checks 'lockout.txt' to avoid bans.
-    2. Rate Limit: Checks every 2 mins, max 2 items.
-    3. TIME GATE: Only marks WIN/LOSS if Market Closed (Time > 16:00 IST).
-    """
     updated = False
     
     # Set Timezone to IST (Indian Standard Time)
@@ -156,22 +161,18 @@ def verify_predictions(history):
                 elif entry['Horizon'] == '1m': required_days = 20
                 
                 # PROFESSIONAL CHECK:
-                # If we are ON the target day, has the market closed yet?
-                # If days_passed == required_days, we must wait until 4:00 PM (16:00)
                 is_target_day = (days_passed == required_days)
                 market_closed = (now_ist.hour >= 16)
 
-                # Only verify if target date passed OR (it is target date AND market is closed)
                 if days_passed > required_days or (is_target_day and market_closed):
                     
                     time.sleep(1) # Polite Delay
                     
                     ticker = entry['Ticker']
                     stock = yf.Ticker(ticker)
-                    hist = stock.history(period="1mo") # Fetch recent data
+                    hist = stock.history(period="1mo") 
                     
                     if not hist.empty:
-                        # Find the Close price on or after target date
                         result_price = hist.iloc[-1]['Close']
                         entry['Exit_Price'] = round(result_price, 2)
                         
@@ -279,19 +280,20 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
         elif graph_range == "6mo": graph_days = 180
         elif graph_range == "1y": graph_days = 365
         
-        # Calculate RSI for UI display logic
+        # Calculate Full Suite of Indicators
         df["RSI"] = calculate_rsi(df["Close"])
         df = add_features(df)
         latest = df.iloc[-1:].copy()
         
-        # --- FEATURE SELECTION FOR MODEL ---
-        # We must select ONLY the columns the model was trained on
-        features = ['SMA_10', 'SMA_50', 'Volatility', 'Return']
+        # --- FEATURE SELECTION FOR TRUE V8 MODEL ---
+        # This list MUST match train_model.py
+        features = ["SMA_10", "SMA_50", "RSI", "Volatility", "MACD", "MACD_Signal", 
+                    "BB_Upper", "BB_Lower", "ATR", "Is_Doji", "Is_Hammer"]
+        features += [f'Return_Lag_{i}' for i in range(1, 6)]
         
         input_df = pd.DataFrame(latest[features].values, columns=features)
         
         # PROBABILITY SCORE (Voting Classifier)
-        # Returns the average confidence of the 3 models
         prob_score = model.predict_proba(input_df)[0][1]
 
         if 0.45 <= prob_score <= 0.55:
