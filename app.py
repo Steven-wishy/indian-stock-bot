@@ -27,6 +27,7 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def add_features(df):
+    # Standard Indicators for Display
     ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema_12 - ema_26
@@ -42,16 +43,14 @@ def add_features(df):
     low_close = abs(df['Low'] - df['Close'].shift())
     df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
 
-    body_size = abs(df['Close'] - df['Open'])
-    full_range = df['High'] - df['Low']
-    upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
-    lower_shadow = df[['Open', 'Close']].min(axis=1) - df['Low']
-    
-    df['Is_Doji'] = (body_size <= (full_range * 0.1)).astype(int)
-    df['Is_Hammer'] = ((lower_shadow >= (body_size * 2)) & (upper_shadow <= (body_size * 0.5))).astype(int)
+    # --- CRITICAL: FEATURES FOR VOTING CLASSIFIER ---
+    # These must match train_model.py EXACTLY
+    df['SMA_10'] = df['Close'].rolling(window=10).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    df['Volatility'] = df['Close'].rolling(window=10).std()
+    df['Prev_Close'] = df['Close'].shift(1)
+    df['Return'] = (df['Close'] - df['Prev_Close']) / df['Prev_Close']
 
-    for lag in range(1, 6):
-        df[f'Return_Lag_{lag}'] = df['Close'].pct_change(lag)
     return df
 
 def generate_reasoning(row):
@@ -280,18 +279,19 @@ def get_prediction_and_data(ticker, horizon="1d", graph_range="3mo", wallet=1000
         elif graph_range == "6mo": graph_days = 180
         elif graph_range == "1y": graph_days = 365
         
-        df["SMA_10"] = df["Close"].rolling(window=10).mean()
-        df["SMA_50"] = df["Close"].rolling(window=50).mean()
+        # Calculate RSI for UI display logic
         df["RSI"] = calculate_rsi(df["Close"])
-        df["Volatility"] = df["Close"].rolling(window=10).std()
         df = add_features(df)
         latest = df.iloc[-1:].copy()
         
-        features = ["SMA_10", "SMA_50", "RSI", "Volatility", "MACD", "MACD_Signal", 
-                    "BB_Upper", "BB_Lower", "ATR", "Is_Doji", "Is_Hammer"]
-        features += [f'Return_Lag_{i}' for i in range(1, 6)]
+        # --- FEATURE SELECTION FOR MODEL ---
+        # We must select ONLY the columns the model was trained on
+        features = ['SMA_10', 'SMA_50', 'Volatility', 'Return']
         
         input_df = pd.DataFrame(latest[features].values, columns=features)
+        
+        # PROBABILITY SCORE (Voting Classifier)
+        # Returns the average confidence of the 3 models
         prob_score = model.predict_proba(input_df)[0][1]
 
         if 0.45 <= prob_score <= 0.55:
@@ -349,7 +349,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Oracle V6</title>
+    <title>Oracle V8</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -398,7 +398,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="app">
         <div class="header">
-            <h1>ORACLE <span>/// V6</span></h1>
+            <h1>ORACLE <span>/// V8</span></h1>
         </div>
 
         <form method="POST" class="controls">
